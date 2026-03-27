@@ -256,6 +256,21 @@ pub(crate) struct UserPromptSubmitHookSpecificOutputWire {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub(crate) struct StopHookSpecificOutputWire {
+    pub hook_event_name: HookEventNameWire,
+    #[serde(default)]
+    pub action: Option<StopHookActionWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub(crate) enum StopHookActionWire {
+    #[serde(rename = "compact")]
+    Compact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 #[schemars(rename = "stop.command.output")]
 pub(crate) struct StopCommandOutputWire {
     #[serde(flatten)]
@@ -266,6 +281,8 @@ pub(crate) struct StopCommandOutputWire {
     /// semantic rule during output parsing rather than in the JSON schema.
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub hook_specific_output: Option<StopHookSpecificOutputWire>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

@@ -37,6 +37,7 @@ pub struct StopOutcome {
     pub stop_reason: Option<String>,
     pub should_block: bool,
     pub block_reason: Option<String>,
+    pub should_compact: bool,
     pub continuation_fragments: Vec<HookPromptFragment>,
 }
 
@@ -46,6 +47,7 @@ struct StopHandlerData {
     stop_reason: Option<String>,
     should_block: bool,
     block_reason: Option<String>,
+    should_compact: bool,
     continuation_fragments: Vec<HookPromptFragment>,
 }
 
@@ -73,6 +75,7 @@ pub(crate) async fn run(
             stop_reason: None,
             should_block: false,
             block_reason: None,
+            should_compact: false,
             continuation_fragments: Vec::new(),
         };
     }
@@ -116,6 +119,7 @@ pub(crate) async fn run(
         stop_reason: aggregate.stop_reason,
         should_block: aggregate.should_block,
         block_reason: aggregate.block_reason,
+        should_compact: aggregate.should_compact,
         continuation_fragments: aggregate.continuation_fragments,
     }
 }
@@ -131,6 +135,7 @@ fn parse_completed(
     let mut stop_reason = None;
     let mut should_block = false;
     let mut block_reason = None;
+    let mut should_compact = false;
     let mut continuation_prompt = None;
 
     match run_result.error.as_deref() {
@@ -163,11 +168,11 @@ fn parse_completed(
                                 text: stop_reason_text,
                             });
                         }
-                    } else if let Some(invalid_block_reason) = parsed.invalid_block_reason {
+                    } else if let Some(ref invalid_block_reason) = parsed.invalid_block_reason {
                         status = HookRunStatus::Failed;
                         entries.push(HookOutputEntry {
                             kind: HookOutputEntryKind::Error,
-                            text: invalid_block_reason,
+                            text: invalid_block_reason.clone(),
                         });
                     } else if parsed.should_block {
                         if let Some(reason) =
@@ -190,6 +195,16 @@ fn parse_completed(
                                         .to_string(),
                             });
                         }
+                    }
+                    if !should_stop
+                        && parsed.invalid_block_reason.is_none()
+                        && parsed.should_compact
+                    {
+                        should_compact = true;
+                        entries.push(HookOutputEntry {
+                            kind: HookOutputEntryKind::Warning,
+                            text: "hook requested compaction after the current turn".to_string(),
+                        });
                     }
                 } else {
                     status = HookRunStatus::Failed;
@@ -256,6 +271,7 @@ fn parse_completed(
             stop_reason,
             should_block,
             block_reason,
+            should_compact: !should_stop && should_compact,
             continuation_fragments,
         },
     }
@@ -268,6 +284,7 @@ fn aggregate_results<'a>(
     let should_stop = results.iter().any(|result| result.should_stop);
     let stop_reason = results.iter().find_map(|result| result.stop_reason.clone());
     let should_block = !should_stop && results.iter().any(|result| result.should_block);
+    let should_compact = !should_stop && results.iter().any(|result| result.should_compact);
     let block_reason = if should_block {
         common::join_text_chunks(
             results
@@ -293,6 +310,7 @@ fn aggregate_results<'a>(
         stop_reason,
         should_block,
         block_reason,
+        should_compact,
         continuation_fragments,
     }
 }
@@ -304,6 +322,7 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> StopOu
         stop_reason: None,
         should_block: false,
         block_reason: None,
+        should_compact: false,
         continuation_fragments: Vec::new(),
     }
 }
@@ -345,6 +364,7 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("retry with tests".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![HookPromptFragment {
                     text: "retry with tests".to_string(),
                     hook_run_id: parsed.completed.run.id.clone(),
@@ -352,6 +372,72 @@ mod tests {
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
+    }
+
+    #[test]
+    fn compact_action_marks_result_for_compaction() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"hookSpecificOutput":{"hookEventName":"Stop","action":"compact"}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(
+            parsed.data,
+            StopHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                should_block: false,
+                block_reason: None,
+                should_compact: true,
+                continuation_fragments: Vec::new(),
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
+        assert_eq!(
+            parsed.completed.run.entries,
+            vec![HookOutputEntry {
+                kind: HookOutputEntryKind::Warning,
+                text: "hook requested compaction after the current turn".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn compact_action_can_block_and_request_compaction() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"decision":"block","reason":"retry with tests","hookSpecificOutput":{"hookEventName":"Stop","action":"compact"}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(
+            parsed.data,
+            StopHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                should_block: true,
+                block_reason: Some("retry with tests".to_string()),
+                should_compact: true,
+                continuation_fragments: vec![HookPromptFragment {
+                    text: "retry with tests".to_string(),
+                    hook_run_id: parsed.completed.run.id.clone(),
+                }],
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
+        assert!(parsed.completed.run.entries.iter().any(|entry| {
+            entry.kind == HookOutputEntryKind::Warning
+                && entry.text == "hook requested compaction after the current turn"
+        }));
     }
 
     #[test]
@@ -374,6 +460,36 @@ mod tests {
     }
 
     #[test]
+    fn compact_action_is_recorded_without_blocking() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"hookSpecificOutput":{"hookEventName":"Stop","action":"compact"}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(
+            parsed.data,
+            StopHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                should_block: false,
+                block_reason: None,
+                should_compact: true,
+                continuation_fragments: Vec::new(),
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
+        assert!(parsed.completed.run.entries.iter().any(|entry| {
+            entry.kind == HookOutputEntryKind::Warning
+                && entry.text == "hook requested compaction after the current turn"
+        }));
+    }
+
+    #[test]
     fn continue_false_overrides_block_decision() {
         let parsed = parse_completed(
             &handler(),
@@ -392,6 +508,7 @@ mod tests {
                 stop_reason: Some("done".to_string()),
                 should_block: false,
                 block_reason: None,
+                should_compact: false,
                 continuation_fragments: Vec::new(),
             }
         );
@@ -413,6 +530,7 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("retry with tests".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![HookPromptFragment {
                     text: "retry with tests".to_string(),
                     hook_run_id: parsed.completed.run.id.clone(),
@@ -489,6 +607,7 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("first".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![HookPromptFragment::from_single_hook(
                     "first", "run-1",
                 )],
@@ -498,6 +617,7 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("second".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![HookPromptFragment::from_single_hook(
                     "second", "run-2",
                 )],
@@ -511,10 +631,83 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("first\n\nsecond".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![
                     HookPromptFragment::from_single_hook("first", "run-1"),
                     HookPromptFragment::from_single_hook("second", "run-2"),
                 ],
+            }
+        );
+    }
+
+    #[test]
+    fn aggregate_results_keeps_compact_when_no_stop_requested() {
+        let aggregate = aggregate_results([
+            &StopHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                should_block: false,
+                block_reason: None,
+                should_compact: true,
+                continuation_fragments: Vec::new(),
+            },
+            &StopHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                should_block: true,
+                block_reason: Some("retry".to_string()),
+                should_compact: false,
+                continuation_fragments: vec![HookPromptFragment::from_single_hook(
+                    "retry", "run-2",
+                )],
+            },
+        ]);
+
+        assert_eq!(
+            aggregate,
+            StopHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                should_block: true,
+                block_reason: Some("retry".to_string()),
+                should_compact: true,
+                continuation_fragments: vec![HookPromptFragment::from_single_hook(
+                    "retry", "run-2",
+                )],
+            }
+        );
+    }
+
+    #[test]
+    fn stop_takes_precedence_over_compact() {
+        let aggregate = aggregate_results([
+            &StopHandlerData {
+                should_stop: true,
+                stop_reason: Some("done".to_string()),
+                should_block: false,
+                block_reason: None,
+                should_compact: true,
+                continuation_fragments: Vec::new(),
+            },
+            &StopHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                should_block: false,
+                block_reason: None,
+                should_compact: true,
+                continuation_fragments: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(
+            aggregate,
+            StopHandlerData {
+                should_stop: true,
+                stop_reason: Some("done".to_string()),
+                should_block: false,
+                block_reason: None,
+                should_compact: false,
+                continuation_fragments: Vec::new(),
             }
         );
     }

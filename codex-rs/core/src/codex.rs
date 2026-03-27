@@ -5941,6 +5941,20 @@ pub(crate) async fn run_turn(
                         sess.send_event(&turn_context, EventMsg::HookCompleted(completed))
                             .await;
                     }
+                    if stop_outcome.should_compact
+                        && let Err(err) = run_auto_compact(
+                            &sess,
+                            &turn_context,
+                            InitialContextInjection::DoNotInject,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            turn_id = %turn_context.sub_id,
+                            error = ?err,
+                            "stop hook requested compaction but the compaction run failed"
+                        );
+                    }
                     if stop_outcome.should_block {
                         if let Some(hook_prompt_message) =
                             build_hook_prompt_message(&stop_outcome.continuation_fragments)
