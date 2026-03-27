@@ -258,6 +258,8 @@ pub(crate) struct UserPromptSubmitHookSpecificOutputWire {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StopHookSpecificOutputWire {
     pub hook_event_name: HookEventNameWire,
+    /// Closed set of post-turn requests supported by the Stop hook contract.
+    /// This is intentionally not a generic action bus.
     #[serde(default)]
     pub action: Option<StopHookActionWire>,
 }

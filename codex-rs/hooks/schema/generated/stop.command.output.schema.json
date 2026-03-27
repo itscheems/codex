@@ -33,7 +33,8 @@
               "$ref": "#/definitions/StopHookActionWire"
             }
           ],
-          "default": null
+          "default": null,
+          "description": "Closed set of post-turn requests supported by the Stop hook contract. This is intentionally not a generic action bus."
         },
         "hookEventName": {
           "$ref": "#/definitions/HookEventNameWire"

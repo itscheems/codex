@@ -5941,6 +5941,11 @@ pub(crate) async fn run_turn(
                         sess.send_event(&turn_context, EventMsg::HookCompleted(completed))
                             .await;
                     }
+                    // Stop hooks can only request a single post-turn compaction
+                    // pass. We run it before recording any continuation prompt
+                    // so the next turn resumes from compacted state when possible.
+                    // Best-effort: compaction failure does not suppress a valid
+                    // continuation request.
                     if stop_outcome.should_compact
                         && let Err(err) = run_auto_compact(
                             &sess,

@@ -170,6 +170,48 @@ print(json.dumps({{
     Ok(())
 }
 
+fn write_parallel_stop_hooks_with_compact_action(home: &Path, hook_count: usize) -> Result<()> {
+    let hook_entries = (0..hook_count)
+        .map(|index| {
+            let script_path = home.join(format!("stop_hook_compact_{index}.py"));
+            let script = r#"import json
+import sys
+
+payload = json.load(sys.stdin)
+print(json.dumps({
+    "systemMessage": "stop hook requested compact",
+    "hookSpecificOutput": {
+        "hookEventName": "Stop",
+        "action": "compact"
+    }
+}))
+"#;
+            fs::write(&script_path, script).with_context(|| {
+                format!(
+                    "write stop hook compact script fixture at {}",
+                    script_path.display()
+                )
+            })?;
+            Ok(serde_json::json!({
+                "type": "command",
+                "command": format!("python3 {}", script_path.display()),
+                "statusMessage": format!("running stop hook {}", index + 1),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let hooks = serde_json::json!({
+        "hooks": {
+            "Stop": [{
+                "hooks": hook_entries,
+            }]
+        }
+    });
+
+    fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
 fn write_compacting_stop_hook(home: &Path, continuation_prompt: &str) -> Result<()> {
     let script_path = home.join("stop_hook_compact.py");
     let prompt_json = serde_json::to_string(continuation_prompt)
@@ -915,6 +957,57 @@ async fn stop_hook_can_trigger_inline_compaction() -> Result<()> {
         rollout_compacted_count(&rollout_text)?,
         1,
         "rollout should record a single compaction item",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiple_stop_hooks_still_compact_at_most_once_per_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let regular_response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "draft before compact"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let compact_response =
+        mount_compact_user_history_with_summary_once(&server, "hook-triggered summary").await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) = write_parallel_stop_hooks_with_compact_action(home, 2) {
+                panic!("failed to write parallel stop hook compact fixtures: {error}");
+            }
+        })
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("compact after this answer").await?;
+
+    assert_eq!(regular_response.requests().len(), 1);
+    assert_eq!(
+        compact_response.requests().len(),
+        1,
+        "multiple Stop-hook compact requests should still trigger only one compaction pass",
+    );
+
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let rollout_text = fs::read_to_string(&rollout_path)?;
+    assert_eq!(
+        rollout_compacted_count(&rollout_text)?,
+        1,
+        "rollout should record a single compaction item for the turn",
     );
 
     Ok(())

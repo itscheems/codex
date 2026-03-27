@@ -47,6 +47,8 @@ struct StopHandlerData {
     stop_reason: Option<String>,
     should_block: bool,
     block_reason: Option<String>,
+    // Aggregated to a single turn-level request; multiple hooks still produce
+    // at most one compaction run for the current turn.
     should_compact: bool,
     continuation_fragments: Vec<HookPromptFragment>,
 }
