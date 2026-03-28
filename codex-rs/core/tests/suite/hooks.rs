@@ -40,6 +40,7 @@ use wiremock::MockServer;
 const FIRST_CONTINUATION_PROMPT: &str = "Retry with exactly the phrase meow meow meow.";
 const SECOND_CONTINUATION_PROMPT: &str = "Now tighten it to just: meow.";
 const BLOCKED_PROMPT_CONTEXT: &str = "Remember the blocked lighthouse note.";
+const STOP_HOOK_DEV_INSTRUCTIONS: &str = "STOP_HOOK_CONTINUATION_DEV_INSTRUCTIONS";
 
 fn write_stop_hook(home: &Path, block_prompts: &[&str]) -> Result<()> {
     let script_path = home.join("stop_hook.py");
@@ -1050,6 +1051,7 @@ async fn blocking_stop_hook_can_request_compaction_before_continuation() -> Resu
         })
         .with_config(move |config| {
             config.model_provider = model_provider;
+            config.developer_instructions = Some(STOP_HOOK_DEV_INSTRUCTIONS.to_string());
             config
                 .features
                 .enable(Feature::CodexHooks)
@@ -1073,6 +1075,12 @@ async fn blocking_stop_hook_can_request_compaction_before_continuation() -> Resu
         request_hook_prompt_texts(&requests[2]),
         vec![FIRST_CONTINUATION_PROMPT.to_string()],
         "continuation request should retain the stop hook prompt after compaction",
+    );
+    assert!(
+        requests[2]
+            .message_input_texts("developer")
+            .contains(&STOP_HOOK_DEV_INSTRUCTIONS.to_string()),
+        "continuation request should keep developer instructions after stop-hook compaction",
     );
 
     Ok(())

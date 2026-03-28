@@ -5948,12 +5948,13 @@ pub(crate) async fn run_turn(
                     // not suppress a valid continuation request. User interruption
                     // still aborts the turn.
                     if stop_outcome.should_compact {
-                        match run_auto_compact(
-                            &sess,
-                            &turn_context,
-                            InitialContextInjection::DoNotInject,
-                        )
-                        .await
+                        let initial_context_injection = if stop_outcome.should_block {
+                            InitialContextInjection::BeforeLastUserMessage
+                        } else {
+                            InitialContextInjection::DoNotInject
+                        };
+                        match run_auto_compact(&sess, &turn_context, initial_context_injection)
+                            .await
                         {
                             Ok(()) => {}
                             Err(CodexErr::Interrupted) => return None,
