@@ -5780,6 +5780,7 @@ pub(crate) async fn run_turn(
         .await;
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
+    let mut stop_hook_compaction_ran = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
@@ -5947,7 +5948,8 @@ pub(crate) async fn run_turn(
                     // Best-effort for ordinary failures: a failed compaction does
                     // not suppress a valid continuation request. User interruption
                     // still aborts the turn.
-                    if stop_outcome.should_compact {
+                    if stop_outcome.should_compact && !stop_hook_compaction_ran {
+                        stop_hook_compaction_ran = true;
                         let initial_context_injection = if stop_outcome.should_block {
                             InitialContextInjection::BeforeLastUserMessage
                         } else {

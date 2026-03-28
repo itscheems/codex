@@ -3,7 +3,6 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
-use codex_core::ModelProviderInfo;
 use codex_core::built_in_model_providers;
 use codex_features::Feature;
 use codex_protocol::items::parse_hook_prompt_fragment;
@@ -35,7 +34,6 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
-use wiremock::MockServer;
 
 const FIRST_CONTINUATION_PROMPT: &str = "Retry with exactly the phrase meow meow meow.";
 const SECOND_CONTINUATION_PROMPT: &str = "Now tighten it to just: meow.";
@@ -214,27 +212,42 @@ print(json.dumps({
     Ok(())
 }
 
-fn write_compacting_stop_hook(home: &Path, continuation_prompt: &str) -> Result<()> {
+fn write_compacting_stop_hook(home: &Path, continuation_prompts: &[&str]) -> Result<()> {
     let script_path = home.join("stop_hook_compact.py");
-    let prompt_json = serde_json::to_string(continuation_prompt)
-        .context("serialize compacting stop hook continuation prompt")?;
+    let log_path = home.join("stop_hook_log.jsonl");
+    let prompts_json = serde_json::to_string(continuation_prompts)
+        .context("serialize compacting stop hook continuation prompts")?;
     let script = format!(
         r#"import json
+from pathlib import Path
 import sys
 
+log_path = Path(r"{log_path}")
 payload = json.load(sys.stdin)
-if payload.get("stop_hook_active"):
-    print(json.dumps({{"systemMessage": "done"}}))
-else:
+prompts = {prompts_json}
+existing = []
+if log_path.exists():
+    existing = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+with log_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload) + "\n")
+
+invocation_index = len(existing)
+
+if invocation_index < len(prompts):
+    prompt = prompts[invocation_index]
     print(json.dumps({{
         "decision": "block",
-        "reason": {prompt_json},
+        "reason": prompt,
         "hookSpecificOutput": {{
             "hookEventName": "Stop",
             "action": "compact"
         }}
     }}))
-"#
+else:
+    print(json.dumps({{"systemMessage": "done"}}))
+"#,
+        log_path = log_path.display(),
     );
     let hooks = serde_json::json!({
         "hooks": {
@@ -251,14 +264,6 @@ else:
     fs::write(&script_path, script).context("write compacting stop hook script")?;
     fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
     Ok(())
-}
-
-fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
-    let mut provider = built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
-    provider.name = "OpenAI (test)".into();
-    provider.base_url = Some(format!("{}/v1", server.uri()));
-    provider.supports_websockets = false;
-    provider
 }
 
 fn write_user_prompt_submit_hook(
@@ -1020,6 +1025,7 @@ async fn blocking_stop_hook_can_request_compaction_before_continuation() -> Resu
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
+    let base_url = format!("{}/v1", server.uri());
     let responses = mount_sse_sequence(
         &server,
         vec![
@@ -1041,16 +1047,19 @@ async fn blocking_stop_hook_can_request_compaction_before_continuation() -> Resu
         ],
     )
     .await;
-    let model_provider = non_openai_model_provider(&server);
-
     let mut builder = test_codex()
         .with_pre_build_hook(|home| {
-            if let Err(error) = write_compacting_stop_hook(home, FIRST_CONTINUATION_PROMPT) {
+            if let Err(error) = write_compacting_stop_hook(home, &[FIRST_CONTINUATION_PROMPT]) {
                 panic!("failed to write compacting stop hook fixtures: {error}");
             }
         })
         .with_config(move |config| {
-            config.model_provider = model_provider;
+            let mut provider =
+                built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
+            provider.name = "OpenAI (test)".into();
+            provider.base_url = Some(base_url.clone());
+            provider.supports_websockets = false;
+            config.model_provider = provider;
             config.developer_instructions = Some(STOP_HOOK_DEV_INSTRUCTIONS.to_string());
             config
                 .features
@@ -1081,6 +1090,100 @@ async fn blocking_stop_hook_can_request_compaction_before_continuation() -> Resu
             .message_input_texts("developer")
             .contains(&STOP_HOOK_DEV_INSTRUCTIONS.to_string()),
         "continuation request should keep developer instructions after stop-hook compaction",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_blocking_stop_hook_compacts_at_most_once_per_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let base_url = format!("{}/v1", server.uri());
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "draft one"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-compact"),
+                ev_assistant_message("msg-compact", "summary after compact"),
+                ev_completed("resp-compact"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "draft two"),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-3", "final draft"),
+                ev_completed("resp-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) = write_compacting_stop_hook(
+                home,
+                &[FIRST_CONTINUATION_PROMPT, SECOND_CONTINUATION_PROMPT],
+            ) {
+                panic!("failed to write repeated compacting stop hook fixtures: {error}");
+            }
+        })
+        .with_config(move |config| {
+            let mut provider =
+                built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
+            provider.name = "OpenAI (test)".into();
+            provider.base_url = Some(base_url.clone());
+            provider.supports_websockets = false;
+            config.model_provider = provider;
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("compact only once even if stop hook blocks twice")
+        .await?;
+
+    let requests = responses.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "one turn with two stop-hook continuations should compact at most once",
+    );
+    assert!(
+        request_hook_prompt_texts(&requests[1]).is_empty(),
+        "the single compaction request should not include a continuation prompt",
+    );
+    assert_eq!(
+        request_hook_prompt_texts(&requests[2]),
+        vec![FIRST_CONTINUATION_PROMPT.to_string()],
+        "first continuation should keep the first stop-hook prompt",
+    );
+    assert_eq!(
+        request_hook_prompt_texts(&requests[3]),
+        vec![
+            FIRST_CONTINUATION_PROMPT.to_string(),
+            SECOND_CONTINUATION_PROMPT.to_string()
+        ],
+        "second continuation should preserve both accumulated hook prompts without re-compacting",
+    );
+
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let rollout_text = fs::read_to_string(&rollout_path)?;
+    assert_eq!(
+        rollout_compacted_count(&rollout_text)?,
+        1,
+        "repeated stop-hook continuations should still record only one compaction item",
     );
 
     Ok(())
@@ -1125,7 +1228,7 @@ async fn interrupted_stop_hook_compaction_aborts_before_continuation() -> Result
 
     let mut builder = test_codex()
         .with_pre_build_hook(|home| {
-            if let Err(error) = write_compacting_stop_hook(home, FIRST_CONTINUATION_PROMPT) {
+            if let Err(error) = write_compacting_stop_hook(home, &[FIRST_CONTINUATION_PROMPT]) {
                 panic!("failed to write compacting stop hook fixtures: {error}");
             }
         })
