@@ -443,6 +443,36 @@ mod tests {
     }
 
     #[test]
+    fn compact_action_requires_stop_hook_event_name() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","action":"compact"}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(
+            parsed.data,
+            StopHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                should_block: false,
+                block_reason: None,
+                should_compact: false,
+                continuation_fragments: Vec::new(),
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
+        assert!(
+            parsed.completed.run.entries.is_empty(),
+            "mismatched hookEventName should not request stop-hook compaction",
+        );
+    }
+
+    #[test]
     fn block_decision_without_reason_is_invalid() {
         let parsed = parse_completed(
             &handler(),

@@ -48,6 +48,7 @@ pub(crate) struct StopOutput {
 }
 
 use crate::schema::BlockDecisionWire;
+use crate::schema::HookEventNameWire;
 use crate::schema::HookUniversalOutputWire;
 use crate::schema::PostToolUseCommandOutputWire;
 use crate::schema::PreToolUseCommandOutputWire;
@@ -193,8 +194,10 @@ pub(crate) fn parse_stop(stdout: &str) -> Option<StopOutput> {
         reason: wire.reason,
         invalid_block_reason,
         should_compact: matches!(
-            wire.hook_specific_output.and_then(|output| output.action),
-            Some(StopHookActionWire::Compact)
+            wire.hook_specific_output,
+            Some(output)
+                if output.hook_event_name == HookEventNameWire::Stop
+                    && output.action == Some(StopHookActionWire::Compact)
         ),
     })
 }

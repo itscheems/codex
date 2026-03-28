@@ -5944,21 +5944,27 @@ pub(crate) async fn run_turn(
                     // Stop hooks can only request a single post-turn compaction
                     // pass. We run it before recording any continuation prompt
                     // so the next turn resumes from compacted state when possible.
-                    // Best-effort: compaction failure does not suppress a valid
-                    // continuation request.
-                    if stop_outcome.should_compact
-                        && let Err(err) = run_auto_compact(
+                    // Best-effort for ordinary failures: a failed compaction does
+                    // not suppress a valid continuation request. User interruption
+                    // still aborts the turn.
+                    if stop_outcome.should_compact {
+                        match run_auto_compact(
                             &sess,
                             &turn_context,
                             InitialContextInjection::DoNotInject,
                         )
                         .await
-                    {
-                        tracing::warn!(
-                            turn_id = %turn_context.sub_id,
-                            error = ?err,
-                            "stop hook requested compaction but the compaction run failed"
-                        );
+                        {
+                            Ok(()) => {}
+                            Err(CodexErr::Interrupted) => return None,
+                            Err(err) => {
+                                tracing::warn!(
+                                    turn_id = %turn_context.sub_id,
+                                    error = ?err,
+                                    "stop hook requested compaction but the compaction run failed"
+                                );
+                            }
+                        }
                     }
                     if stop_outcome.should_block {
                         if let Some(hook_prompt_message) =

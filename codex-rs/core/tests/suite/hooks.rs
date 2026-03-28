@@ -13,6 +13,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -1074,6 +1075,113 @@ async fn blocking_stop_hook_can_request_compaction_before_continuation() -> Resu
         "continuation request should retain the stop hook prompt after compaction",
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_stop_hook_compaction_aborts_before_continuation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let (gate_compact_completed_tx, gate_compact_completed_rx) = oneshot::channel();
+    let first_chunks = vec![StreamingSseChunk {
+        gate: None,
+        body: sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "draft one"),
+            ev_completed("resp-1"),
+        ]),
+    }];
+    let compact_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_response_created("resp-compact")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_message_item_added("msg-compact", "")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_output_text_delta("summary before interrupt")),
+        },
+        StreamingSseChunk {
+            gate: Some(gate_compact_completed_rx),
+            body: sse(vec![
+                ev_message_item_done("msg-compact", "summary before interrupt"),
+                ev_completed("resp-compact"),
+            ]),
+        },
+    ];
+    let (server, _completions) =
+        start_streaming_sse_server(vec![first_chunks, compact_chunks]).await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) = write_compacting_stop_hook(home, FIRST_CONTINUATION_PROMPT) {
+                panic!("failed to write compacting stop hook fixtures: {error}");
+            }
+        })
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build_with_streaming_server(&server).await?;
+
+    let session_model = test.session_configured.model.clone();
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "compact before continuing".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if server.requests().await.len() >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("compaction request should start before interrupt");
+
+    test.codex.submit(Op::Interrupt).await?;
+
+    let aborted = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    let EventMsg::TurnAborted(event) = aborted else {
+        panic!("expected TurnAborted event");
+    };
+    assert_eq!(event.reason, TurnAbortReason::Interrupted);
+
+    sleep(Duration::from_millis(200)).await;
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "interrupted compaction should not schedule a continuation request",
+    );
+
+    let _ = gate_compact_completed_tx.send(());
+    server.shutdown().await;
     Ok(())
 }
 
