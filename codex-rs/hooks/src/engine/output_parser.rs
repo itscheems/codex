@@ -44,9 +44,11 @@ pub(crate) struct StopOutput {
     pub should_block: bool,
     pub reason: Option<String>,
     pub invalid_block_reason: Option<String>,
+    pub should_compact: bool,
 }
 
 use crate::schema::BlockDecisionWire;
+use crate::schema::HookEventNameWire;
 use crate::schema::HookUniversalOutputWire;
 use crate::schema::PostToolUseCommandOutputWire;
 use crate::schema::PreToolUseCommandOutputWire;
@@ -54,6 +56,7 @@ use crate::schema::PreToolUseDecisionWire;
 use crate::schema::PreToolUsePermissionDecisionWire;
 use crate::schema::SessionStartCommandOutputWire;
 use crate::schema::StopCommandOutputWire;
+use crate::schema::StopHookActionWire;
 use crate::schema::UserPromptSubmitCommandOutputWire;
 
 pub(crate) fn parse_session_start(stdout: &str) -> Option<SessionStartOutput> {
@@ -190,6 +193,12 @@ pub(crate) fn parse_stop(stdout: &str) -> Option<StopOutput> {
         should_block: should_block && invalid_block_reason.is_none(),
         reason: wire.reason,
         invalid_block_reason,
+        should_compact: matches!(
+            wire.hook_specific_output,
+            Some(output)
+                if output.hook_event_name == HookEventNameWire::Stop
+                    && output.action == Some(StopHookActionWire::Compact)
+        ),
     })
 }
 

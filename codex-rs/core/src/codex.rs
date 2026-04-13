@@ -6241,6 +6241,7 @@ pub(crate) async fn run_turn(
         .await;
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
+    let mut stop_hook_compaction_ran = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
@@ -6419,6 +6420,33 @@ pub(crate) async fn run_turn(
                     for completed in stop_outcome.hook_events {
                         sess.send_event(&turn_context, EventMsg::HookCompleted(completed))
                             .await;
+                    }
+                    // Stop hooks can only request a single post-turn compaction
+                    // pass. We run it before recording any continuation prompt
+                    // so the next turn resumes from compacted state when possible.
+                    // Best-effort for ordinary failures: a failed compaction does
+                    // not suppress a valid continuation request. User interruption
+                    // still aborts the turn.
+                    if stop_outcome.should_compact && !stop_hook_compaction_ran {
+                        stop_hook_compaction_ran = true;
+                        let initial_context_injection = if stop_outcome.should_block {
+                            InitialContextInjection::BeforeLastUserMessage
+                        } else {
+                            InitialContextInjection::DoNotInject
+                        };
+                        match run_auto_compact(&sess, &turn_context, initial_context_injection)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(CodexErr::Interrupted) => return None,
+                            Err(err) => {
+                                tracing::warn!(
+                                    turn_id = %turn_context.sub_id,
+                                    error = ?err,
+                                    "stop hook requested compaction but the compaction run failed"
+                                );
+                            }
+                        }
                     }
                     if stop_outcome.should_block {
                         if let Some(hook_prompt_message) =

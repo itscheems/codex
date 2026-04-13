@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_core::built_in_model_providers;
 use codex_features::Feature;
 use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::models::ContentItem;
@@ -11,12 +12,14 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_compact_user_history_with_summary_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -35,6 +38,7 @@ use tokio::time::sleep;
 const FIRST_CONTINUATION_PROMPT: &str = "Retry with exactly the phrase meow meow meow.";
 const SECOND_CONTINUATION_PROMPT: &str = "Now tighten it to just: meow.";
 const BLOCKED_PROMPT_CONTEXT: &str = "Remember the blocked lighthouse note.";
+const STOP_HOOK_DEV_INSTRUCTIONS: &str = "STOP_HOOK_CONTINUATION_DEV_INSTRUCTIONS";
 
 fn write_stop_hook(home: &Path, block_prompts: &[&str]) -> Result<()> {
     let script_path = home.join("stop_hook.py");
@@ -121,6 +125,143 @@ else:
         }
     });
 
+    fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
+fn write_stop_hook_with_compact_action(home: &Path) -> Result<()> {
+    let script_path = home.join("stop_hook_compact.py");
+    let log_path = home.join("stop_hook_log.jsonl");
+    let script = format!(
+        r#"import json
+from pathlib import Path
+import sys
+
+log_path = Path(r"{log_path}")
+payload = json.load(sys.stdin)
+
+with log_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload) + "\n")
+
+print(json.dumps({{
+    "systemMessage": "stop hook requested compact",
+    "hookSpecificOutput": {{
+        "hookEventName": "Stop",
+        "action": "compact"
+    }}
+}}))
+"#,
+        log_path = log_path.display(),
+    );
+    let hooks = serde_json::json!({
+        "hooks": {
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("python3 {}", script_path.display()),
+                    "statusMessage": "running stop hook",
+                }]
+            }]
+        }
+    });
+
+    fs::write(&script_path, script).context("write stop hook compact script")?;
+    fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
+fn write_parallel_stop_hooks_with_compact_action(home: &Path, hook_count: usize) -> Result<()> {
+    let hook_entries = (0..hook_count)
+        .map(|index| {
+            let script_path = home.join(format!("stop_hook_compact_{index}.py"));
+            let script = r#"import json
+import sys
+
+payload = json.load(sys.stdin)
+print(json.dumps({
+    "systemMessage": "stop hook requested compact",
+    "hookSpecificOutput": {
+        "hookEventName": "Stop",
+        "action": "compact"
+    }
+}))
+"#;
+            fs::write(&script_path, script).with_context(|| {
+                format!(
+                    "write stop hook compact script fixture at {}",
+                    script_path.display()
+                )
+            })?;
+            Ok(serde_json::json!({
+                "type": "command",
+                "command": format!("python3 {}", script_path.display()),
+                "statusMessage": format!("running stop hook {}", index + 1),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let hooks = serde_json::json!({
+        "hooks": {
+            "Stop": [{
+                "hooks": hook_entries,
+            }]
+        }
+    });
+
+    fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
+fn write_compacting_stop_hook(home: &Path, continuation_prompts: &[&str]) -> Result<()> {
+    let script_path = home.join("stop_hook_compact.py");
+    let log_path = home.join("stop_hook_log.jsonl");
+    let prompts_json = serde_json::to_string(continuation_prompts)
+        .context("serialize compacting stop hook continuation prompts")?;
+    let script = format!(
+        r#"import json
+from pathlib import Path
+import sys
+
+log_path = Path(r"{log_path}")
+payload = json.load(sys.stdin)
+prompts = {prompts_json}
+existing = []
+if log_path.exists():
+    existing = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+with log_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload) + "\n")
+
+invocation_index = len(existing)
+
+if invocation_index < len(prompts):
+    prompt = prompts[invocation_index]
+    print(json.dumps({{
+        "decision": "block",
+        "reason": prompt,
+        "hookSpecificOutput": {{
+            "hookEventName": "Stop",
+            "action": "compact"
+        }}
+    }}))
+else:
+    print(json.dumps({{"systemMessage": "done"}}))
+"#,
+        log_path = log_path.display(),
+    );
+    let hooks = serde_json::json!({
+        "hooks": {
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("python3 {}", script_path.display()),
+                    "statusMessage": "running compacting stop hook",
+                }]
+            }]
+        }
+    });
+
+    fs::write(&script_path, script).context("write compacting stop hook script")?;
     fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
     Ok(())
 }
@@ -367,6 +508,21 @@ fn rollout_hook_prompt_texts(text: &str) -> Result<Vec<String>> {
         }
     }
     Ok(texts)
+}
+
+fn rollout_compacted_count(text: &str) -> Result<usize> {
+    let mut count = 0;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let rollout: RolloutLine = serde_json::from_str(trimmed).context("parse rollout line")?;
+        if matches!(rollout.item, RolloutItem::Compacted(_)) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn request_hook_prompt_texts(
@@ -756,6 +912,387 @@ async fn multiple_blocking_stop_hooks_persist_multiple_hook_prompt_fragments() -
         "rollout should preserve both hook prompt fragments in order",
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_hook_can_trigger_inline_compaction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let regular_response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "draft before compact"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let compact_response =
+        mount_compact_user_history_with_summary_once(&server, "hook-triggered summary").await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) = write_stop_hook_with_compact_action(home) {
+                panic!("failed to write stop hook compact fixture: {error}");
+            }
+        })
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("compact after this answer").await?;
+
+    assert_eq!(regular_response.requests().len(), 1);
+    assert_eq!(compact_response.requests().len(), 1);
+
+    let hook_inputs = read_stop_hook_inputs(test.codex_home_path())?;
+    assert_eq!(hook_inputs.len(), 1);
+    assert_eq!(
+        hook_inputs[0].get("stop_hook_active"),
+        Some(&Value::Bool(false))
+    );
+
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let rollout_text = fs::read_to_string(&rollout_path)?;
+    assert_eq!(
+        rollout_compacted_count(&rollout_text)?,
+        1,
+        "rollout should record a single compaction item",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiple_stop_hooks_still_compact_at_most_once_per_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let regular_response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "draft before compact"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let compact_response =
+        mount_compact_user_history_with_summary_once(&server, "hook-triggered summary").await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) = write_parallel_stop_hooks_with_compact_action(home, 2) {
+                panic!("failed to write parallel stop hook compact fixtures: {error}");
+            }
+        })
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("compact after this answer").await?;
+
+    assert_eq!(regular_response.requests().len(), 1);
+    assert_eq!(
+        compact_response.requests().len(),
+        1,
+        "multiple Stop-hook compact requests should still trigger only one compaction pass",
+    );
+
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let rollout_text = fs::read_to_string(&rollout_path)?;
+    assert_eq!(
+        rollout_compacted_count(&rollout_text)?,
+        1,
+        "rollout should record a single compaction item for the turn",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_stop_hook_can_request_compaction_before_continuation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let base_url = format!("{}/v1", server.uri());
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "draft one"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-compact"),
+                ev_assistant_message("msg-compact", "summary after compact"),
+                ev_completed("resp-compact"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "final draft"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) = write_compacting_stop_hook(home, &[FIRST_CONTINUATION_PROMPT]) {
+                panic!("failed to write compacting stop hook fixtures: {error}");
+            }
+        })
+        .with_config(move |config| {
+            let mut provider =
+                built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
+            provider.name = "OpenAI (test)".into();
+            provider.base_url = Some(base_url.clone());
+            provider.supports_websockets = false;
+            config.model_provider = provider;
+            config.developer_instructions = Some(STOP_HOOK_DEV_INSTRUCTIONS.to_string());
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("compact before continuing").await?;
+
+    let requests = responses.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected user turn, compaction, and continuation"
+    );
+    assert!(
+        request_hook_prompt_texts(&requests[1]).is_empty(),
+        "compaction request should not include the continuation prompt yet",
+    );
+    assert_eq!(
+        request_hook_prompt_texts(&requests[2]),
+        vec![FIRST_CONTINUATION_PROMPT.to_string()],
+        "continuation request should retain the stop hook prompt after compaction",
+    );
+    assert!(
+        requests[2]
+            .message_input_texts("developer")
+            .contains(&STOP_HOOK_DEV_INSTRUCTIONS.to_string()),
+        "continuation request should keep developer instructions after stop-hook compaction",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_blocking_stop_hook_compacts_at_most_once_per_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let base_url = format!("{}/v1", server.uri());
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "draft one"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-compact"),
+                ev_assistant_message("msg-compact", "summary after compact"),
+                ev_completed("resp-compact"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "draft two"),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-3", "final draft"),
+                ev_completed("resp-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) = write_compacting_stop_hook(
+                home,
+                &[FIRST_CONTINUATION_PROMPT, SECOND_CONTINUATION_PROMPT],
+            ) {
+                panic!("failed to write repeated compacting stop hook fixtures: {error}");
+            }
+        })
+        .with_config(move |config| {
+            let mut provider =
+                built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
+            provider.name = "OpenAI (test)".into();
+            provider.base_url = Some(base_url.clone());
+            provider.supports_websockets = false;
+            config.model_provider = provider;
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("compact only once even if stop hook blocks twice")
+        .await?;
+
+    let requests = responses.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "one turn with two stop-hook continuations should compact at most once",
+    );
+    assert!(
+        request_hook_prompt_texts(&requests[1]).is_empty(),
+        "the single compaction request should not include a continuation prompt",
+    );
+    assert_eq!(
+        request_hook_prompt_texts(&requests[2]),
+        vec![FIRST_CONTINUATION_PROMPT.to_string()],
+        "first continuation should keep the first stop-hook prompt",
+    );
+    assert_eq!(
+        request_hook_prompt_texts(&requests[3]),
+        vec![
+            FIRST_CONTINUATION_PROMPT.to_string(),
+            SECOND_CONTINUATION_PROMPT.to_string()
+        ],
+        "second continuation should preserve both accumulated hook prompts without re-compacting",
+    );
+
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let rollout_text = fs::read_to_string(&rollout_path)?;
+    assert_eq!(
+        rollout_compacted_count(&rollout_text)?,
+        1,
+        "repeated stop-hook continuations should still record only one compaction item",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_stop_hook_compaction_aborts_before_continuation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let (gate_compact_completed_tx, gate_compact_completed_rx) = oneshot::channel();
+    let first_chunks = vec![StreamingSseChunk {
+        gate: None,
+        body: sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "draft one"),
+            ev_completed("resp-1"),
+        ]),
+    }];
+    let compact_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_response_created("resp-compact")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_message_item_added("msg-compact", "")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_output_text_delta("summary before interrupt")),
+        },
+        StreamingSseChunk {
+            gate: Some(gate_compact_completed_rx),
+            body: sse(vec![
+                ev_message_item_done("msg-compact", "summary before interrupt"),
+                ev_completed("resp-compact"),
+            ]),
+        },
+    ];
+    let (server, _completions) =
+        start_streaming_sse_server(vec![first_chunks, compact_chunks]).await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) = write_compacting_stop_hook(home, &[FIRST_CONTINUATION_PROMPT]) {
+                panic!("failed to write compacting stop hook fixtures: {error}");
+            }
+        })
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build_with_streaming_server(&server).await?;
+
+    let session_model = test.session_configured.model.clone();
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "compact before continuing".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if server.requests().await.len() >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("compaction request should start before interrupt");
+
+    test.codex.submit(Op::Interrupt).await?;
+
+    let aborted = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    let EventMsg::TurnAborted(event) = aborted else {
+        panic!("expected TurnAborted event");
+    };
+    assert_eq!(event.reason, TurnAbortReason::Interrupted);
+
+    sleep(Duration::from_millis(200)).await;
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "interrupted compaction should not schedule a continuation request",
+    );
+
+    let _ = gate_compact_completed_tx.send(());
+    server.shutdown().await;
     Ok(())
 }
 
